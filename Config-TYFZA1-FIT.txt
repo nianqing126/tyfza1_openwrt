@@ -1,0 +1,47 @@
+# 追加到 .config 的基础配置（TYFZA1 / rtl9617c / Linux 6.18）
+# 机型相关的 CONFIG_TARGET_rtl9617c_generic_DEVICE_<profile>=y 与
+# CONFIG_TARGET_PROFILE 由 customize.sh 按 board 输入写入。
+# 注意：本文件会在 workflow 的 Configure 步骤里被追加两次，
+#       所有关键包都在最终 defconfig 之后重新硬断言，避免被静默裁掉。
+
+# ---- target ----
+CONFIG_TARGET_rtl9617c=y
+CONFIG_TARGET_rtl9617c_generic=y
+CONFIG_TARGET_BOARD="rtl9617c"
+CONFIG_TARGET_SUBTARGET="generic"
+CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a55"
+
+# ---- FIT ABI 必需 ----
+# fitblk 提供 /lib/upgrade/fit.sh；platform.sh 用 CI_KERNPART=fit + nand_do_upgrade
+CONFIG_PACKAGE_fitblk=y
+# 该 target 的 host fw_printenv 会挂，必须关闭。
+# 注意：上游 DEVICE_PACKAGES 默认带 uboot-envtools，Configure 步骤会强制改回 not set。
+# CONFIG_PACKAGE_uboot-envtools is not set
+
+# ---- 平台 / PON / 无线 ----
+CONFIG_PACKAGE_tyfza1-pon-control=y
+CONFIG_PACKAGE_luci-app-tyfza1-pon=y
+CONFIG_PACKAGE_kmod-rtl-ax-ap=y
+CONFIG_PACKAGE_ubi-utils=y
+CONFIG_PACKAGE_nand-utils=y
+CONFIG_PACKAGE_block-mount=y
+CONFIG_PACKAGE_iw=y
+CONFIG_PACKAGE_wpad-mbedtls=y
+CONFIG_PACKAGE_wifi-scripts=y
+CONFIG_PACKAGE_wireless-regdb=y
+
+# ---- LuCI / 网络 ----
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-ssl=y
+CONFIG_PACKAGE_luci-proto-ppp=y
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_uhttpd=y
+CONFIG_PACKAGE_uhttpd-mod-ubus=y
+CONFIG_PACKAGE_firewall4=y
+CONFIG_PACKAGE_dnsmasq=y
+
+# ---- 时区 UTC+8 ----
+CONFIG_PACKAGE_zoneinfo-core=y
+CONFIG_PACKAGE_zoneinfo-asia=y
+
+# ---- 额外软件包写在仓库根 Config-EXTRA.txt，customize.sh 会自动追加 ----
