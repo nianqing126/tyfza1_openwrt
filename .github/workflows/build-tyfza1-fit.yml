@@ -15,6 +15,12 @@
 # 产物 ABI：factory(8 MiB static) + fit + rootfs_data，sysupgrade.itb。
 # 架构包目录：aarch64_cortex-a55（不是 aarch64_cortex-a53）。
 #
+# 产物格式：上游 lyq1996 源码树只定义 IMAGES := sysupgrade.itb（FIT）。
+#   emit_bin_alias=true 时额外产出同名 .bin（与 .itb 逐字节相同，仅扩展名
+#   不同），用于「恢复网页按扩展名过滤」的场景。这个 .bin 仍是 FIT，不是
+#   LeoooChen 原生 U-Boot 所需的 sysupgrade-tar 格式 sysupgrade.bin，
+#   两者 ABI 不兼容，绝不能混刷。详见 FLASH-FORMAT-NOTES.txt / README。
+#
 # ⚠️ 本项目只保证「能编译出结构自洽的镜像」。首次刷机前务必确认 U-Boot 的
 #    FIT ABI、factory 卷数据与卷表，云编译产物未经你自己的实机验证。
 
@@ -85,6 +91,11 @@ on:
         required: false
         default: ''
         type: string
+      emit_bin_alias:
+        description: '额外产出 *.bin（与 .itb 逐字节相同的别名，仅用于按扩展名过滤的恢复网页）。注意：这不是原生 U-Boot 的 sysupgrade-tar 格式，详见 FLASH-FORMAT-NOTES.txt'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -532,6 +543,7 @@ jobs:
           VERIFIED_BUILD: ${{ inputs.verified_build }}
           ENABLE_OFFLOAD: ${{ inputs.enable_offload }}
           WAN_VLAN: ${{ inputs.wan_vlan }}
+          EMIT_BIN_ALIAS: ${{ inputs.emit_bin_alias }}
         run: |
           set -e
           OUT="$GITHUB_WORKSPACE/artifact"
@@ -545,6 +557,14 @@ jobs:
           ls "$OUT/"*sysupgrade.itb >/dev/null 2>&1 \
             || { echo "::error::没有产出 ${PROFILE} 的 sysupgrade.itb" >&2; exit 1; }
 
+          # 可选：产出 .bin 别名（与 .itb 逐字节相同，仅扩展名不同）。
+          # 只解决「恢复网页按扩展名过滤」这一类问题，不改变固件的 FIT ABI。
+          if [ "${EMIT_BIN_ALIAS:-false}" = "true" ]; then
+            bash "$GITHUB_WORKSPACE/scripts/make-bin-alias.sh" "$OUT"
+          else
+            echo "emit_bin_alias=false，仅产出 .itb（详见 README「固件格式」章节）"
+          fi
+
           cp .config "$OUT/Config-final.txt"
           echo "$SOURCE_HASH" > "$OUT/source-commit.txt"
           {
@@ -555,6 +575,7 @@ jobs:
             echo "source_commit=$SOURCE_HASH"
             echo "abi=ubi_device / factory(8MiB,static) / fit / rootfs_data"
             echo "firmware=sysupgrade.itb (FIT external-static-with-rootfs)"
+            echo "bin_alias=${EMIT_BIN_ALIAS:-false} (true 时 .bin 与 .itb 逐字节相同，非 sysupgrade-tar)"
             echo "arch_packages=aarch64_cortex-a55"
             echo "kernel=$(grep -m1 '^CONFIG_LINUX_VERSION=' .config || echo 6.18)"
             echo "offload_baseline=${ENABLE_OFFLOAD:-false}"
@@ -640,6 +661,8 @@ jobs:
             源码 lyq1996/rtl9617c-openwrt `${{ env.SOURCE_REF }}` @ `${{ env.SOURCE_HASH }}`
             机型 `${{ env.MODEL }}` / profile `${{ env.PROFILE }}` / DTS `${{ env.DTS }}`
             ABI：factory(8 MiB static) + fit + rootfs_data，产物 sysupgrade.itb
+            若勾选 emit_bin_alias，*.bin 与 *.itb 逐字节相同（仅扩展名不同，仍为 FIT），
+            刷机前必读 FLASH-FORMAT-NOTES.txt 与 README 第五章「固件格式与 U-Boot 匹配」。
             配置见 Config-final.txt；校验见 sha256sums.txt
             同批 packages 见 `packages-*.tar.zst`，用法见包内 apk-repos.txt
             ⚠️ 刷机前必须确认 U-Boot FIT ABI、factory 导入与卷表重建。
