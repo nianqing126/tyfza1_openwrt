@@ -16,6 +16,7 @@ echo "=== assets ==="
 [ -d "$ASSETS/.github/workflows" ] || fail "缺 .github/workflows"
 for f in Config-TYFZA1-FIT.txt Config-EXTRA.txt customize.sh \
          scripts/patch-upstream.sh scripts/render-wan-vlan.sh \
+         scripts/make-bin-alias.sh \
          scripts/preflight.sh scripts/verify-fit-boot.py \
          files/etc/uci-defaults/95-tyfza1-offload \
          files/etc/uci-defaults/99-tyfza1-fit; do
