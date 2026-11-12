@@ -1,1 +1,0 @@
-# tyfza1_openwrt
