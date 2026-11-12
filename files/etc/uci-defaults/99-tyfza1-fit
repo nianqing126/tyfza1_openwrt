@@ -1,0 +1,63 @@
+#!/bin/sh
+# 首次开机 uci-defaults：出厂默认兜底 + FIT ABI 接线修正。
+# 执行后系统自动删除。只改「仍是出厂默认值」的项，不覆盖用户自定义配置。
+# 把 FORCE 改成 1 可强制覆盖时区与主机名。
+#
+# 不写 PON SN / MAC / LOID / WiFi 校准：这些在 8 MiB factory 静态卷里，
+# 由 DTS 的 nvmem-layout 按固定偏移读取，属于设备数据，绝不进固件。
+
+FORCE=0
+TZ_NEW='<+08>-8'
+ZONE_NEW='Asia/Shanghai'
+
+case "$(board_name)" in
+  tianyi,tyfza1-2p5g) HOST_NEW='TYFZA1-2.5G' ;;
+  tianyi,tyfza1-4ge)  HOST_NEW='TYFZA1-4GE'  ;;
+  *) HOST_NEW='' ;;
+esac
+
+# ---- 时区 / 主机名 / NTP ----
+cur_tz=$(uci -q get system.@system[0].timezone || true)
+cur_host=$(uci -q get system.@system[0].hostname || true)
+
+apply_tz=0
+case "$cur_tz" in
+  ''|GMT0|UTC|CST-8|'<+08>-8') apply_tz=1 ;;
+esac
+[ "$FORCE" = "1" ] && apply_tz=1
+if [ "$apply_tz" = "1" ]; then
+  uci -q set system.@system[0].timezone="$TZ_NEW"
+  uci -q set system.@system[0].zonename="$ZONE_NEW"
+fi
+
+if [ -n "$HOST_NEW" ]; then
+  case "$cur_host" in
+    ''|ponwrt|OpenWrt|ImmortalWrt) uci -q set system.@system[0].hostname="$HOST_NEW" ;;
+  esac
+  [ "$FORCE" = "1" ] && uci -q set system.@system[0].hostname="$HOST_NEW"
+fi
+
+if uci -q get system.ntp.server | grep -qE 'time\.apple\.com|time1\.google\.com|time\.cloudflare\.com|pool\.ntp\.org'; then
+  uci -q delete system.ntp.server
+  uci -q set system.ntp.enabled='1'
+  uci -q set system.ntp.enable_server='0'
+  for s in ntp.aliyun.com time1.cloud.tencent.com ntp.ntsc.ac.cn cn.pool.ntp.org; do
+    uci -q add_list system.ntp.server="$s"
+  done
+fi
+uci -q commit system
+
+# ---- FIT ABI：关闭 anon_mount ----
+# FIT ABI 下只有 fit（固件）与 rootfs_data（overlay）归 OpenWrt 所有；
+# block-mount 的 anon_mount 可能把残留的原厂 UBIFS 卷以 rw 挂上并重放日志，
+# 必须关掉，否则会出现「配置写不进去 / 重启回退」这类怪现象。
+case "$(board_name)" in
+  tianyi,tyfza1-2p5g|tianyi,tyfza1-4ge)
+    [ "$(uci -q get fstab.@global[0].anon_mount)" = 0 ] || {
+      uci -q set fstab.@global[0].anon_mount='0'
+      uci -q commit fstab
+    }
+    ;;
+esac
+
+exit 0
