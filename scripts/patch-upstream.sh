@@ -70,29 +70,51 @@ else:
 PY
 fi
 
-# ---------- 2. 91-tyfza1-pon-offload: 键存在即退出 ----------
-# 仅在 enable_offload=true 时修上游 91 脚本，保证该开关 false 时真的
-# 「保留上游原始行为」，而不是被修补后间接又打开了 offload。
+# ---------- 2. 91-tyfza1-pon-offload: offload 值纠正 ----------
+# 不再用「精确匹配上游某一行」来判断是否需要修补：不同 source_ref / commit
+# 里这个脚本的写法不一样（键存在即退出 / 已修正为 = "1" / = 1 / 别的写法），
+# 精确匹配一旦落空就会误判为「已修好」并跳过，紧接着的断言又失败 → 构建挂掉。
+#
+# 改为幂等注入：在 shebang 之后插入一段带唯一标记的兜底块，抢在原有逻辑
+# 之前把两个 offload 值纠正为 1。无论上游怎么写、是否已有值判断，结果都一致；
+# 断言只检查我们自己的标记，必然通过。上游原有内容一字不删。
+# 另：rootfs 里的 95-tyfza1-offload（执行序在 91 之后）也会无条件兜底。
+GUARD_MARK='TYFZA1_CLOUDBUILD_OFFLOAD_GUARD'
+
 if [ "${ENABLE_OFFLOAD:-true}" != "true" ]; then
   echo "91-tyfza1-pon-offload: enable_offload=false，保留上游原始行为，跳过修补"
 elif [ -f "$OFFLOAD_UCD" ]; then
-  if grep -q "uci -q get 'firewall.@defaults\[0\].flow_offloading_hw' >/dev/null && exit 0" "$OFFLOAD_UCD"; then
-    python3 - "$OFFLOAD_UCD" <<'PY'
+  if ! grep -qF "$GUARD_MARK" "$OFFLOAD_UCD"; then
+    python3 - "$OFFLOAD_UCD" "$GUARD_MARK" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
+mark = sys.argv[2]
 text = p.read_text(encoding='utf-8')
-old = "uci -q get 'firewall.@defaults[0].flow_offloading_hw' >/dev/null && exit 0"
-new = "[ \"$(uci -q get 'firewall.@defaults[0].flow_offloading_hw')\" = 1 ] && exit 0"
-if old not in text:
-    raise SystemExit('ERROR: 未找到预期的 offload 早退行')
-p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
-print('patched 91-tyfza1-pon-offload: 只在值为 1 时退出')
+# r-string：让 shell 续行符 \ 保持字面，避免转义歧义
+block = r"""# TYFZA1_CLOUDBUILD_OFFLOAD_GUARD (idempotent, injected by patch-upstream.sh)
+# 上游各 commit 写法不一，这里抢在原有逻辑之前无条件纠正两个 offload 值。
+if [ -r /sys/bus/platform/devices/4f5500000.pon/fe ] && \
+   grep -q '^available=1' /sys/bus/platform/devices/4f5500000.pon/fe; then
+        [ "$(uci -q get 'firewall.@defaults[0].flow_offloading_hw')" = "1" ] || \
+                uci set 'firewall.@defaults[0].flow_offloading_hw=1'
+        [ "$(uci -q get 'firewall.@defaults[0].flow_offloading')" = "1" ] || \
+                uci set 'firewall.@defaults[0].flow_offloading=1'
+        uci commit firewall
+fi
+""".replace('TYFZA1_CLOUDBUILD_OFFLOAD_GUARD', mark)
+lines = text.splitlines(keepends=True)
+idx = 1 if (lines and lines[0].startswith('#!')) else 0
+lines.insert(idx, block)
+p.write_text(''.join(lines), encoding='utf-8', newline='\n')
+print('patched 91-tyfza1-pon-offload: injected offload value guard')
 PY
   else
-    echo "91-tyfza1-pon-offload: 已是修好的版本（本次或上游已修），跳过"
+    echo "91-tyfza1-pon-offload: 注入块已存在，跳过（幂等）"
   fi
-  grep -q 'flow_offloading_hw.*= 1' "$OFFLOAD_UCD" \
-    || fail '91-tyfza1-pon-offload 修补后仍未见值判断'
+  grep -qF "$GUARD_MARK" "$OFFLOAD_UCD" \
+    || fail '91-tyfza1-pon-offload 注入块未生效'
+  sh -n "$OFFLOAD_UCD" \
+    || fail '91-tyfza1-pon-offload 注入后 shell 语法错误'
 else
   echo "WARN: 未找到 $OFFLOAD_UCD，跳过（rootfs 的 95-tyfza1-offload 仍会兜底）" >&2
 fi
