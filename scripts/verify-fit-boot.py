@@ -11,9 +11,15 @@ qwe-qaq/rtl9617c-uboot 里没有任何 rootdisk/fitblk 代码。本脚本把"固
      loadables 里包含 rootfs 子镜像名；
   2. rootfs 子镜像 type=filesystem，data-position 与 data-size 都 4K 对齐
      （内核 fitblk 驱动会跳过未对齐的子镜像）；
-  3. DTB 的 /chosen 必须有 bootargs 含 root=/dev/fitblk0 与 rootwait；
-  4. DTB 的 /chosen 必须有 u-boot,version（内核 fitblk 驱动的门闩）；
-  5. DTB 的 /chosen/rootdisk phandle 必须指向一个 volname="fit" 的 UBI 卷节点。
+  3. 所有形态都必须有 bootargs 含 root=/dev/fitblk*（否则内核挂根必失败）；
+  4~6 分两种 /chosen profile：
+     - PT1570-R10（严格）：DTS 硬编码 u-boot,version / rootdisk / rootwait，
+       其 U-Boot 不注入 bootargs，缺少任一项都无法启动 → 硬断言 fail；
+     - TYFZA1（宽松，lyq1996 上游）：走 fitblk 构建期注入 root=/dev/fitblk0，
+       /chosen 不含 u-boot,version / rootdisk，上游全树也无 rootwait —— 这是
+       该机型既有可启动形态，rootwait / u-boot,version / rootdisk 仅作 warning。
+
+  判别依据：/chosen 里出现 u-boot,version 或 rootdisk 即视为 PT1570 严格形态。
 
 用法：
   python3 verify-fit-boot.py <xxx-sysupgrade.itb>
@@ -113,7 +119,16 @@ def fail(msg):
 
 
 def check_devtree(dtb, label="DTB"):
-    """校验 /chosen 是否满足 fitblk 自洽启动条件。返回 True/抛 fail。"""
+    """校验 /chosen 是否满足 fitblk 自洽启动条件。返回 True/抛 fail。
+
+    PT1570-R10 与 TYFZA1 是两套不同的 FIT 启动方案，用 /chosen 里是否出现
+    u-boot,version 或 rootdisk 来判别：
+      * 严格（PT1570）：这些属性缺一不可，仍按原逻辑 fail；
+      * 宽松（TYFZA1，lyq1996 上游）：bootargs 由 fitblk 构建期注入，仅要求
+        root=/dev/fitblk*；rootwait / u-boot,version / rootdisk 只给 warning。
+        fitblk 是内核启动早期同步注册的块设备（非异步探测），不需要 rootwait；
+        该机型上游全树从不带 rootwait，是已验证可启动的形态。
+    """
     dev = parse_fdt(dtb)
     chosen = dev.find("/chosen")
     if chosen is None:
@@ -121,20 +136,37 @@ def check_devtree(dtb, label="DTB"):
 
     bootargs = sval(chosen.props.get("bootargs", b""))
     print("  bootargs: %s" % (bootargs or "<空>"))
+
+    # 通用硬检查：任何形态都必须显式带 root=/dev/fitblk*
     if BOOT_ROOT not in bootargs:
         fail("%s 的 bootargs 里没有 %s0 —— bootloader 不会替你注入，内核会挂根失败"
              % (label, BOOT_ROOT))
-    if "rootwait" not in bootargs:
-        fail("%s 的 bootargs 里没有 rootwait —— ubiblock/fitblk 可能晚于挂根出现" % label)
+
+    strict = ("u-boot,version" in chosen.props) or ("rootdisk" in chosen.props)
+    print("  /chosen profile: %s" % ("PT1570-R10 strict" if strict else "TYFZA1 relaxed"))
+
+    def require(cond, msg):
+        if cond:
+            return True
+        if strict:
+            fail("%s %s" % (label, msg))
+        print("::warning::FIT_BOOT: %s %s（TYFZA1 上游形态，非致命）" % (label, msg))
+        return False
+
+    require("rootwait" in bootargs,
+            "的 bootargs 里没有 rootwait —— ubiblock/fitblk 可能晚于挂根出现")
 
     if "u-boot,version" not in chosen.props:
-        fail("%s 的 /chosen 缺少 u-boot,version —— 内核 fitblk_init 会静默 return 0，"
-             "不注册 /dev/fitblk0" % label)
-    print("  u-boot,version: %r" % sval(chosen.props["u-boot,version"]))
+        require(False, "的 /chosen 缺少 u-boot,version —— 内核 fitblk_init 会静默 "
+                       "return 0，不注册 /dev/fitblk0")
+    else:
+        print("  u-boot,version: %r" % sval(chosen.props["u-boot,version"]))
 
     rd = chosen.props.get("rootdisk")
     if rd is None:
-        fail("%s 的 /chosen 缺少 rootdisk phandle" % label)
+        require(False, "的 /chosen 缺少 rootdisk phandle")
+        return True
+
     phandle = be32(rd, 0)
     target = None
     for n in dev.walk():
@@ -143,11 +175,11 @@ def check_devtree(dtb, label="DTB"):
             target = n
             break
     if target is None:
-        fail("%s 的 rootdisk phandle %d 找不到对应节点" % (label, phandle))
+        require(False, "的 rootdisk phandle %d 找不到对应节点" % phandle)
+        return True
     volname = sval(target.props.get("volname", b""))
     print("  rootdisk -> %s (volname=%r)" % (target.path(), volname))
-    if volname != "fit":
-        fail("%s 的 rootdisk 指向 volname=%r，不是 fit 卷" % (label, volname))
+    require(volname == "fit", "的 rootdisk 指向 volname=%r，不是 fit 卷" % volname)
     return True
 
 
