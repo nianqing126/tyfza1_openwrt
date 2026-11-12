@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "description": "TYFZA1 云编译输入锁定。改 source_ref 前请确认新 commit 的 target/linux/rtl9617c 仍满足 workflow 的 Verify upstream TYFZA1 support 断言。",
+  "source": {
+    "repository": "https://github.com/lyq1996/rtl9617c-openwrt.git",
+    "pinned_ref": "20b4cf4490ca55cc406d07e391691efa8cd8a087",
+    "pinned_ref_origin": "PT1570-R10-Actions 流水线已实跑通过的 commit（feature/pt1500-h10-openwrt-fixes 系列）",
+    "main_observed": "cea9938fc81fd7fe2b7a9ddd71f2d0e4ed7895bf (2026-10-29)",
+    "note": "已直接核实 main 的 90-tyfza1-pon-wan 只做「未配置 WAN 时绑 pon0 + dhcp」；PT1570-R10-Actions 的 95-pt1570-wan-default 注释记载 pinned 分支一带是 EPON VLAN 3961 + offload 0，该记载来自上游脚本注释，本次因网络受限未能拉取 pinned commit 复核。请以所选 ref 的实际内容为准，不要照抄任何省份/运营商参数。"
+  },
+  "pipeline_basis": {
+    "repository": "https://github.com/nianqing126/PT1570-R10-Actions",
+    "reused": [
+      "PE 固件预构建（make -C target/linux/rtl9617c/pe 生成 pe-tx-code.h）",
+      "ubuntu-24.04 依赖清单（clang-18 三件套 + rust aarch64-unknown-linux-musl）",
+      "feeds 更新与权限收敛",
+      "先写最小 .config 再 defconfig 的顺序（防 mediatek/openwrt_one 包污染）",
+      "FIT 内核符号与 verify-fit-boot.py 校验",
+      "同批 packages（kmod 绑定内核 vermagic）收集与发布"
+    ],
+    "removed_for_tyfza1": [
+      "apply-board.sh / board/（TYFZA1 的 Device、DTS、白名单都在上游源码树里）",
+      "95-pt1570-wan-default 的 VLAN 1101 硬编码",
+      "PT1570 的 UNVERIFIED / R10-only 门禁"
+    ]
+  },
+  "assets": {
+    "wifi_firmware": {
+      "origin": "nianqing126/PT1570-R10-Actions files/lib/firmware/realtek/tyfza1/",
+      "count": 7,
+      "files": {
+        "rtl8852c-u1-ap.bin": 406448,
+        "rtl8852c-u2-ap.bin": 369160,
+        "rtl8192xb-u1-ap.bin": 387680,
+        "rtl8192xb-u2-ap.bin": 387752,
+        "array_mp_8852c_nctl_reg.bin": 14256,
+        "array_mp_8852c_nctl_reg_a.bin": 14152,
+        "array_mp_8192xb_nctl_reg.bin": 11368
+      },
+      "note": "上游源码树不含任何 WiFi AP 固件，必须由 files/ overlay 注入；缺一个驱动 request_firmware 即失败。"
+    }
+  },
+  "target": {
+    "board": "rtl9617c",
+    "subtarget": "generic",
+    "kernel": "6.18",
+    "arch_packages": "aarch64_cortex-a55",
+    "profiles": {
+      "2p5g": {
+        "profile": "tianyi_tyfza1_2p5g",
+        "board_name": "tianyi,tyfza1-2p5g",
+        "dts": "rtl9617c-tyfza1-2p5g"
+      },
+      "4ge": {
+        "profile": "tianyi_tyfza1_4ge",
+        "board_name": "tianyi,tyfza1-4ge",
+        "dts": "rtl9617c-tyfza1-4ge"
+      }
+    },
+    "image_abi": "factory(8MiB static) + fit + rootfs_data -> sysupgrade.itb"
+  }
+}

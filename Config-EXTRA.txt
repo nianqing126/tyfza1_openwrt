@@ -1,0 +1,21 @@
+# 用户额外软件包（每行一个 CONFIG_PACKAGE_<name>=y）
+# customize.sh 会把本文件追加到 .config；workflow 的 Configure 步骤会在
+# 最终 make defconfig 之后逐个硬断言，缺包直接构建失败，避免「看似成功但少插件」。
+#
+# 注意：
+#  1. 本源码树 feeds.conf.default 指向官方 git.openwrt.org，
+#     immortalwrt 专属包（如 vlmcsd）不在其中，写了会断言失败。
+#  2. 架构目录是 aarch64_cortex-a55，外部 apk 镜像通常没有该目录；
+#     装包优先用同批产出的 packages（customfeeds.list）。
+#  3. 内核模块（kmod-*）与本次内核 vermagic 绑定，必须与固件成对使用。
+#
+# 下面是可选示例，默认全部注释，保持最小可启动镜像。取消注释即可启用：
+
+# CONFIG_PACKAGE_tailscale=y
+# CONFIG_PACKAGE_luci-app-tailscale-community=y
+# CONFIG_PACKAGE_luci-i18n-tailscale-community-zh-cn=y
+# CONFIG_PACKAGE_kmod-tun=y
+# CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+# CONFIG_PACKAGE_iperf3=y
+# CONFIG_PACKAGE_htop=y
+# CONFIG_LUCI_LANG_zh_Hans=y
