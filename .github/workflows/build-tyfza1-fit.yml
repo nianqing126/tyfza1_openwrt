@@ -1,0 +1,645 @@
+# SPDX-License-Identifier: MIT
+# TYFZA1 (RTL9617C) 独立云编译工程
+#
+# 组合来源：
+#   - 源码树：lyq1996/rtl9617c-openwrt（target/linux/rtl9617c，Linux 6.18）
+#   - 流水线骨架：nianqing126/PT1570-R10-Actions（同一源码树，已跑通的
+#     PE 预构建 / feeds / defconfig 断言 / FIT 校验 / 同批 packages 流程）
+#
+# 与 PT1570-R10-Actions 的关键差异：
+#   TYFZA1 的 Device / DTS / base-files / platform.sh 白名单 **都在上游源码树里**，
+#   所以本项目删掉了 apply-board.sh 与 board/ 注入环节，改为静态断言校验。
+#   保留下来的通用资产：PE 固件预构建、7 个 WiFi AP 固件、tyfza1-factory
+#   参数错位修补、verify-fit-boot.py、防 defconfig 污染的多次断言。
+#
+# 产物 ABI：factory(8 MiB static) + fit + rootfs_data，sysupgrade.itb。
+# 架构包目录：aarch64_cortex-a55（不是 aarch64_cortex-a53）。
+#
+# ⚠️ 本项目只保证「能编译出结构自洽的镜像」。首次刷机前务必确认 U-Boot 的
+#    FIT ABI、factory 卷数据与卷表，云编译产物未经你自己的实机验证。
+
+name: Build TYFZA1 FIT
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: '板型：2p5g = 2.5GE+3xGE，4ge = 全千兆 4xGE'
+        required: true
+        default: '2p5g'
+        type: choice
+        options: [2p5g, 4ge]
+      source_ref:
+        description: 'lyq1996/rtl9617c-openwrt 的 commit / 分支（默认锁定 PT1570 流水线已验证的 commit）'
+        required: false
+        default: '20b4cf4490ca55cc406d07e391691efa8cd8a087'
+        type: string
+      enable_offload:
+        description: '编译期固化 PON FE + 软件/硬件 flow offload（对应 400~500M 吞吐卡点）'
+        required: false
+        default: true
+        type: boolean
+      wan_vlan:
+        description: '可选 WAN VLAN ID。留空 = 保持上游默认（pon0）。移动 XGPON 常见 1101，EPON 常见 3961；不确定就留空'
+        required: false
+        default: ''
+        type: string
+      wan_vlan_mode:
+        description: '仅当填写了 wan_vlan 时生效的 PON 模式'
+        required: false
+        default: 'xgpon'
+        type: choice
+        options: [xgpon, gpon, epon]
+      test_only:
+        description: '只生成 .config 与静态校验报告，不编译'
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: '发布到 GitHub Release（需同时勾选 verified_build）'
+        required: false
+        default: false
+        type: boolean
+      verified_build:
+        description: '我已实机验证本产物可正常启动（勾选后不再附带 DO-NOT-FLASH 警告，并允许发布 Release）'
+        required: false
+        default: false
+        type: boolean
+      publish_packages:
+        description: '同期收集并发布配套 packages（kmod 与本次内核 vermagic 绑定）'
+        required: false
+        default: true
+        type: boolean
+      packages_repo_url:
+        description: '可选：自建 packages 静态源根 URL，随固件写入 customfeeds.list'
+        required: false
+        default: ''
+        type: string
+      apk_mirror_base:
+        description: '可选：外部 apk 镜像根 URL。本 target 是 aarch64_cortex-a55，多数国内镜像无该目录，留空最安全'
+        required: false
+        default: ''
+        type: string
+      apk_repo_key_url:
+        description: '可选：外部 apk 源公钥 URL'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tyfza1-fit-${{ inputs.board }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  FORCE_UNSAFE_CONFIGURE: 1
+
+jobs:
+  build:
+    name: FIT / rtl9617c / TYFZA1-${{ inputs.board }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout build assets
+        uses: actions/checkout@v5
+
+      - name: Resolve board parameters
+        env:
+          BOARD: ${{ inputs.board }}
+        run: |
+          set -e
+          case "$BOARD" in
+            2p5g)
+              echo "PROFILE=tianyi_tyfza1_2p5g"        >> "$GITHUB_ENV"
+              echo "BOARD_NAME=tianyi,tyfza1-2p5g"     >> "$GITHUB_ENV"
+              echo "DTS=rtl9617c-tyfza1-2p5g"          >> "$GITHUB_ENV"
+              echo "MODEL=TYFZA1-2.5G"                 >> "$GITHUB_ENV"
+              ;;
+            4ge)
+              echo "PROFILE=tianyi_tyfza1_4ge"         >> "$GITHUB_ENV"
+              echo "BOARD_NAME=tianyi,tyfza1-4ge"      >> "$GITHUB_ENV"
+              echo "DTS=rtl9617c-tyfza1-4ge"           >> "$GITHUB_ENV"
+              echo "MODEL=TYFZA1-4GE"                  >> "$GITHUB_ENV"
+              ;;
+            *) echo "ERROR: 不支持的 board=$BOARD" >&2; exit 1 ;;
+          esac
+          case "$BOARD" in
+            2p5g) P=tianyi_tyfza1_2p5g; D=rtl9617c-tyfza1-2p5g ;;
+            4ge)  P=tianyi_tyfza1_4ge;  D=rtl9617c-tyfza1-4ge  ;;
+          esac
+          echo "board=$BOARD profile=$P dts=$D"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift
+          sudo apt-get clean
+          df -h /
+          sudo mkdir -p /mnt/build_wrt
+          sudo chown "$USER:$USER" /mnt/build_wrt
+          ln -s /mnt/build_wrt "$GITHUB_WORKSPACE/wrt"
+          df -h /mnt
+
+      - name: Install build dependencies
+        # PE 固件是 MIPS32 裸机程序，target/linux/rtl9617c/pe/Makefile 硬编码
+        # clang-18 / ld.lld-18 / llvm-objcopy-18，必须显式装 18 版本三件套。
+        # tyfza1-pon-control 是 Rust 包，需要 aarch64-unknown-linux-musl std。
+        run: |
+          sudo apt-get update -yqq
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang clang-18 cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld lld-18 llvm llvm-18 ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+          if command -v rustup >/dev/null 2>&1; then
+            rustup target add aarch64-unknown-linux-musl
+            rustup target list --installed
+          else
+            echo "::error::runner 缺 rustup，无法补 aarch64-unknown-linux-musl std" >&2
+            exit 1
+          fi
+
+      - name: Clone rtl9617c-openwrt source
+        run: |
+          set -e
+          REF="${{ inputs.source_ref || '20b4cf4490ca55cc406d07e391691efa8cd8a087' }}"
+          cd /mnt/build_wrt
+          git init -q
+          git remote add origin https://github.com/lyq1996/rtl9617c-openwrt.git
+          if ! git fetch -q --depth=1 origin "$REF"; then
+            echo "WARN: 按该 ref 拉取失败，回退到 main" >&2
+            git fetch -q --depth=1 origin main
+          fi
+          git checkout -q FETCH_HEAD
+          echo "SOURCE_HASH=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_REF=$REF"                   >> "$GITHUB_ENV"
+          echo "source: $(git rev-parse HEAD)"
+
+      - name: Verify upstream TYFZA1 support
+        # TYFZA1 是上游源码树的一等公民，不需要注入 DTS/Device。
+        # 这里只做静态断言，源码 commit 换版本后立即暴露不兼容。
+        working-directory: wrt
+        run: |
+          set -e
+          test -f target/linux/rtl9617c/image/Makefile
+          test -f target/linux/rtl9617c/dts/rtl9617c-tyfza1.dtsi
+          test -f "target/linux/rtl9617c/dts/${DTS}.dts"
+          test -f package/utils/fitblk/files/fit.sh
+          test -f target/linux/rtl9617c/pe/Makefile
+          grep -q "^TARGET_DEVICES += ${PROFILE}$" target/linux/rtl9617c/image/Makefile \
+            || { echo "::error::上游 image/Makefile 缺 Device ${PROFILE}" >&2; exit 1; }
+          grep -q "^CONFIG_UIMAGE_FIT_BLK=y$" target/linux/rtl9617c/config-6.18 \
+            || { echo "::error::target config-6.18 未打开 UIMAGE_FIT_BLK" >&2; exit 1; }
+          grep -q "^CONFIG_MTD_ROOTFS_ROOT_DEV=y$" target/linux/generic/config-6.18 \
+            || { echo "::error::generic config-6.18 未打开 MTD_ROOTFS_ROOT_DEV" >&2; exit 1; }
+          grep -q "${BOARD_NAME}" target/linux/rtl9617c/base-files/lib/upgrade/platform.sh \
+            || { echo "::error::platform.sh 升级白名单缺 ${BOARD_NAME}" >&2; exit 1; }
+          grep -q "\"${BOARD_NAME}\"" "target/linux/rtl9617c/dts/${DTS}.dts" \
+            || { echo "::error::${DTS}.dts 的 compatible 与 ${BOARD_NAME} 不符" >&2; exit 1; }
+          echo "UPSTREAM_TYFZA1_OK=True profile=$PROFILE dts=$DTS board_name=$BOARD_NAME"
+
+      - name: Build PE firmware (pe-tx-code.h)
+        # pe-tx-code.h 被上游 .gitignore 排除，OpenWrt 构建系统不会自动生成。
+        # 必须在任何 make 之前构建，否则 target/linux/compile 报
+        # "pe-tx-code.h is missing; run make -C target/linux/rtl9617c/pe"。
+        working-directory: wrt
+        run: |
+          set -eo pipefail
+          for t in clang-18 ld.lld-18 llvm-objcopy-18 python3; do
+            command -v "$t" >/dev/null 2>&1 \
+              || { echo "::error::PE 构建缺少工具 $t" >&2; exit 1; }
+            printf '  OK   %-20s %s\n' "$t" "$(command -v "$t")"
+          done
+          if ! make -C target/linux/rtl9617c/pe 2>&1 | tee /tmp/pe-build.log; then
+            tail -n 60 /tmp/pe-build.log
+            echo "::error::PE 固件构建失败，pe-tx-code.h 未生成" >&2
+            exit 1
+          fi
+          HDR=target/linux/rtl9617c/files-6.18/drivers/net/wireless/realtek/rtl_ax_ap/pe-tx-code.h
+          test -s "$HDR" || { echo "::error::pe-tx-code.h 未生成或为空" >&2; exit 1; }
+          grep -q 'static const u32 pe_tx_program\[\]' "$HDR" \
+            || { echo "::error::pe-tx-code.h 内容不符" >&2; exit 1; }
+          echo "PE_HEADER_OK=True bytes=$(wc -c < "$HDR")"
+
+      - name: Pin APK signing key (optional)
+        working-directory: wrt
+        env:
+          APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
+        run: |
+          if [ -n "$APK_SIGNING_KEY" ]; then
+            umask 077
+            printf '%s\n' "$APK_SIGNING_KEY" > private-key.pem
+            openssl ec -in private-key.pem -pubout -out public-key.pem
+            echo "APK build key pinned:"; sha256sum public-key.pem
+          else
+            echo "no APK_SIGNING_KEY: 本次固件与 packages 仅互相信任"
+          fi
+
+      - name: Update and install feeds
+        working-directory: wrt
+        run: |
+          set -e
+          LOG="$GITHUB_WORKSPACE/step-feeds.log"
+          : > "$LOG"
+          exec > >(tee -a "$LOG") 2>&1
+          trap 'rc=$?; if [ "$rc" -ne 0 ]; then
+            sleep 1; echo "::group::FEEDS FAILED (exit $rc)"; tail -n 80 "$LOG"; echo "::endgroup::";
+            echo "::error::feeds 失败，见 build-log artifact"; fi' EXIT
+          echo "STEP: feeds update -a"
+          ./scripts/feeds update -a
+          echo "STEP: feeds install -a"
+          ./scripts/feeds install -a
+          echo "STEP: fix feed file permissions"
+          chmod -R go-w feeds/luci feeds/packages 2>/dev/null || true
+          find feeds/luci -path '*/root/usr/share/rpcd/ucode/*' -type f -exec chmod 0755 {} + 2>/dev/null || true
+          find feeds/luci -path '*/root/usr/share/rpcd/acl.d/*.json' -type f -exec chmod 0644 {} + 2>/dev/null || true
+
+      - name: Apply custom rootfs files
+        env:
+          PACKAGES_REPO_URL: ${{ inputs.packages_repo_url }}
+          ENABLE_OFFLOAD: ${{ inputs.enable_offload }}
+          WAN_VLAN: ${{ inputs.wan_vlan }}
+          WAN_VLAN_MODE: ${{ inputs.wan_vlan_mode }}
+          # BOARD_NAME 由 Resolve board parameters 写入 GITHUB_ENV，后续步骤直接继承
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/wrt/files"
+          cp -a "$GITHUB_WORKSPACE/files/." "$GITHUB_WORKSPACE/wrt/files/"
+          chmod +x "$GITHUB_WORKSPACE/wrt/files/etc/uci-defaults/"* 2>/dev/null || true
+
+          # enable_offload=false 时移除编译期固化的 offload 脚本
+          if [ "${ENABLE_OFFLOAD:-false}" != "true" ]; then
+            rm -f "$GITHUB_WORKSPACE/wrt/files/etc/uci-defaults/95-tyfza1-offload"
+            echo "offload baseline: disabled (保留上游 91-tyfza1-pon-offload 行为)"
+          else
+            echo "offload baseline: enabled (FE + flow_offloading + flow_offloading_hw)"
+          fi
+
+          # 可选 WAN VLAN：不硬编码省份/运营商参数，由本次构建输入决定。
+          # 渲染逻辑放在独立脚本里，避免 YAML 块标量内嵌 heredoc 的缩进陷阱。
+          if [ -n "${WAN_VLAN:-}" ]; then
+            bash "$GITHUB_WORKSPACE/scripts/render-wan-vlan.sh" \
+              "$GITHUB_WORKSPACE/wrt/files/etc/uci-defaults/96-tyfza1-wan-vlan" \
+              "$WAN_VLAN" "$WAN_VLAN_MODE" "$BOARD_NAME"
+          else
+            echo "wan_vlan: 留空，保持上游默认（pon0）"
+          fi
+
+          if [ -n "$PACKAGES_REPO_URL" ]; then
+            URL="${PACKAGES_REPO_URL%/}"
+            mkdir -p "$GITHUB_WORKSPACE/wrt/files/etc/apk/repositories.d"
+            {
+              echo '# 本次固件同批编译的 packages 源'
+              echo "$URL/targets/rtl9617c/generic/packages/packages.adb"
+            } > "$GITHUB_WORKSPACE/wrt/files/etc/apk/repositories.d/customfeeds.list"
+          fi
+          echo "=== injected rootfs files ==="
+          find "$GITHUB_WORKSPACE/wrt/files" -type f -printf '  %P\n' | sort
+
+      - name: Patch upstream (factory blob + offload defaults)
+        env:
+          ASSETS: ${{ github.workspace }}
+          WRT: ${{ github.workspace }}/wrt
+          ENABLE_OFFLOAD: ${{ inputs.enable_offload }}
+        run: bash "$GITHUB_WORKSPACE/scripts/patch-upstream.sh"
+
+      - name: Configure
+        working-directory: wrt
+        env:
+          ASSETS: ${{ github.workspace }}
+          APK_MIRROR_BASE: ${{ inputs.apk_mirror_base }}
+          APK_REPO_KEY_URL: ${{ inputs.apk_repo_key_url }}
+          ENABLE_OFFLOAD: ${{ inputs.enable_offload }}
+        run: |
+          set -e
+          # 顺序敏感：绝不能在空 .config 上先跑 make defconfig。
+          # 上游 target-metadata.pl 把 Target System 默认成 mediatek/filogic，
+          # 空配置 defconfig 会把 openwrt_one 的包集（kmod-mac80211 等）写成
+          # 显式 =y，切到 rtl9617c 后与 kmod-rtl-ax-ap 自带的 cfg80211.ko
+          # 互相覆盖，package/install Error 1。正确顺序：先写最小配置再 defconfig。
+          rm -f .config
+          cat "$ASSETS/Config-TYFZA1-FIT.txt" >> .config
+          bash "$ASSETS/customize.sh"
+
+          # 该 target 的 host fw_printenv 会挂；DEVICE_PACKAGES 默认带了
+          # uboot-envtools，必须强制关掉（PT1570 流水线同款处理）。
+          sed -i 's|^CONFIG_PACKAGE_uboot-envtools=y|# CONFIG_PACKAGE_uboot-envtools is not set|' .config
+
+          make defconfig
+          cat "$ASSETS/Config-TYFZA1-FIT.txt" >> .config
+          make defconfig
+
+          for sym in tyfza1-pon-control luci-app-tyfza1-pon luci-ssl uhttpd fitblk; do
+            if ! grep -q "^CONFIG_PACKAGE_${sym}=y$" .config; then
+              sed -i "/^# CONFIG_PACKAGE_${sym} is not set$/d; /^CONFIG_PACKAGE_${sym}=/d" .config
+              echo "CONFIG_PACKAGE_${sym}=y" >> .config
+              echo "  re-asserted $sym"
+            fi
+          done
+          make defconfig
+
+          # Config-EXTRA.txt 里的用户包，在最终 defconfig 后重新断言
+          USER_PKGS=$(sed -n 's/^CONFIG_PACKAGE_\([a-zA-Z0-9_.+-]*\)=y$/\1/p' "$ASSETS/Config-EXTRA.txt" | tr '\n' ' ')
+          echo "===== user packages: ${USER_PKGS:-（无）} ====="
+          for p in $USER_PKGS; do
+            if ! grep -q "^CONFIG_PACKAGE_${p}=y$" .config; then
+              sed -i "/^# CONFIG_PACKAGE_${p} is not set$/d; /^CONFIG_PACKAGE_${p}=/d" .config
+              echo "CONFIG_PACKAGE_${p}=y" >> .config
+            fi
+          done
+          make defconfig
+          for p in $USER_PKGS; do
+            grep -q "^CONFIG_PACKAGE_${p}=y$" .config \
+              || { echo "::error::$p 未启用（feed 里没有或依赖不满足）" >&2; exit 1; }
+            echo "  OK   $p"
+          done
+
+          echo "===== hard assertions ====="
+          grep -q "^CONFIG_TARGET_rtl9617c_generic_DEVICE_${PROFILE}=y$" .config \
+            || { echo "::error::profile ${PROFILE} 未启用" >&2; exit 1; }
+          echo "  OK   profile $PROFILE"
+          for sym in tyfza1-pon-control luci-app-tyfza1-pon luci-ssl uhttpd fitblk; do
+            grep -q "^CONFIG_PACKAGE_${sym}=y$" .config \
+              || { echo "::error::$sym 被 defconfig 丢弃" >&2; exit 1; }
+            echo "  OK   $sym"
+          done
+          grep -q '^# CONFIG_PACKAGE_uboot-envtools is not set$' .config \
+            || { echo "::error::uboot-envtools 必须关闭" >&2; exit 1; }
+          echo "  OK   uboot-envtools disabled"
+
+          # 防回归：空配置 defconfig 会残留 mediatek/openwrt_one 包
+          for bad in kmod-mac80211 kmod-cfg80211 kmod-mt7915e kmod-mt76-core \
+                     wpad-basic-mbedtls mt7981-wo-firmware eip197-mini-firmware \
+                     airoha-en8811h-firmware kmod-phy-airoha-en8811h kmod-rtc-pcf8563; do
+            if grep -qE "^CONFIG_PACKAGE_${bad}=(y|m)$" .config; then
+              echo "::error::检测到污染包 ${bad}，检查 Configure 初始化顺序" >&2; exit 1
+            fi
+          done
+          echo "  OK   无 mediatek/openwrt_one 残留包"
+          for good in kmod-fs-ext4 kmod-fs-vfat kmod-nls-utf8 kmod-usb-storage \
+                      kmod-usb-storage-uas wpad-mbedtls kmod-rtl-ax-ap; do
+            grep -q "^CONFIG_PACKAGE_${good}=y$" .config \
+              || { echo "::error::设备包 ${good} 未启用" >&2; exit 1; }
+          done
+          echo "  OK   设备包齐全"
+
+          # 编译期 offload 基线与 uci-defaults 一致性
+          if [ "${ENABLE_OFFLOAD:-false}" = "true" ]; then
+            test -x files/etc/uci-defaults/95-tyfza1-offload \
+              || { echo "::error::缺 95-tyfza1-offload" >&2; exit 1; }
+            echo "  OK   offload baseline in rootfs"
+          fi
+
+          echo "===== key config ====="
+          grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE)=' .config || true
+          cp .config "$ASSETS/Config-final.txt"
+
+      - name: Run static preflight
+        if: ${{ inputs.test_only }}
+        env:
+          ASSETS: ${{ github.workspace }}
+          WRT: ${{ github.workspace }}/wrt
+        run: bash "$ASSETS/scripts/preflight.sh"
+
+      - name: Upload config (test_only)
+        if: ${{ inputs.test_only }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: tyfza1-${{ inputs.board }}-config-${{ github.run_number }}
+          path: |
+            Config-final.txt
+            step-feeds.log
+          retention-days: 14
+
+      - name: Download sources
+        if: ${{ !inputs.test_only }}
+        working-directory: wrt
+        run: |
+          make package/base-files/clean >/dev/null 2>&1 || true
+          make download -j"$(nproc)"
+
+      - name: Compile
+        if: ${{ !inputs.test_only }}
+        working-directory: wrt
+        run: |
+          set -o pipefail
+          LOG="$GITHUB_WORKSPACE/build.log"
+          : > "$LOG"
+          if make -j"$(nproc)" 2>&1 | tee -a "$LOG"; then
+            echo "PARALLEL_BUILD_OK=True"
+          else
+            echo "::warning::并行编译失败，改用 -j1 V=s 重试"
+            if make -j1 V=s 2>&1 | tee -a "$LOG"; then
+              echo "SERIAL_BUILD_OK=True"
+            else
+              echo "::group::BUILD FAILED - last 120 lines"
+              tail -n 120 "$LOG"
+              echo "::endgroup::"
+              grep -E 'Error [0-9]|^make(\[[0-9]+\])?: \*\*\*|error:|No such file|not found|No space left|Killed|undefined reference|FATAL|FAIL' "$LOG" \
+                | tail -n 8 | tr -d '\r' | while IFS= read -r l; do
+                    echo "::error::${l//%/%25}"
+                  done
+              exit 1
+            fi
+          fi
+
+      - name: Verify image payload
+        if: ${{ !inputs.test_only }}
+        working-directory: wrt
+        env:
+          ASSETS: ${{ github.workspace }}
+          ENABLE_OFFLOAD: ${{ inputs.enable_offload }}
+        run: |
+          set -e
+          ROOT=$(ls -d build_dir/target-*/root-rtl9617c* 2>/dev/null | head -1)
+          [ -n "$ROOT" ] || { echo "::error::找不到 rootfs 目录" >&2; exit 1; }
+          echo "rootfs dir: $ROOT"
+
+          # 上游没有任何包安装 WiFi AP 固件，必须由 files/ overlay 带进镜像
+          missing=0
+          for f in "$ASSETS"/files/lib/firmware/realtek/tyfza1/*.bin; do
+            base=${f##*/}
+            tgt="$ROOT/lib/firmware/realtek/tyfza1/$base"
+            [ -f "$tgt" ] || { echo "::error::镜像缺 WiFi 固件 $base"; missing=1; continue; }
+            cmp -s "$f" "$tgt" || { echo "::error::镜像内 $base 与资产不一致"; missing=1; }
+          done
+          [ "$missing" = 0 ] || exit 1
+          n=$(ls -1 "$ROOT"/lib/firmware/realtek/tyfza1/*.bin 2>/dev/null | wc -l)
+          [ "$n" = 7 ] || { echo "::error::镜像内 WiFi 固件数量 $n != 7" >&2; exit 1; }
+          echo "WIFI_FIRMWARE_OK=True files=$n"
+
+          grep -q 'mv "\$tmp" "\$3"' "$ROOT/etc/init.d/tyfza1-factory" \
+            || { echo "::error::tyfza1-factory 未应用 factory_blob 修补" >&2; exit 1; }
+          echo "FACTORY_PATCH_OK=True"
+
+          if [ "${ENABLE_OFFLOAD:-false}" = "true" ]; then
+            U="$ROOT/etc/uci-defaults/95-tyfza1-offload"
+            [ -x "$U" ] || { echo "::error::95-tyfza1-offload 缺失或丢可执行位" >&2; exit 1; }
+            grep -q "flow_offloading_hw='1'" "$U" \
+              || { echo "::error::offload 脚本未设置 flow_offloading_hw" >&2; exit 1; }
+            echo "OFFLOAD_BASELINE_OK=True"
+          fi
+
+          # FIT rootfs 自洽性
+          KCFG=$(ls -d build_dir/target-*/linux-rtl9617c/linux-*/.config 2>/dev/null | head -1)
+          if [ -n "$KCFG" ]; then
+            for sym in CONFIG_UIMAGE_FIT_BLK CONFIG_MTD_ROOTFS_ROOT_DEV CONFIG_SQUASHFS; do
+              grep -q "^${sym}=y$" "$KCFG" \
+                || { echo "::error::内核 $KCFG 里 ${sym} 不是 y" >&2; exit 1; }
+            done
+            echo "KERNEL_FIT_ROOTFS_OK=True"
+          else
+            echo "::warning::找不到内核编译后的 .config，跳过内核符号校验"
+          fi
+
+          ITB=$(ls bin/targets/rtl9617c/generic/*sysupgrade.itb 2>/dev/null | head -1)
+          [ -n "$ITB" ] || { echo "::error::找不到 sysupgrade.itb" >&2; exit 1; }
+          python3 "$ASSETS/scripts/verify-fit-boot.py" "$ITB"
+          echo "IMAGE_PAYLOAD_OK=True"
+
+      - name: Upload build log (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: tyfza1-${{ inputs.board }}-build-log-${{ github.run_number }}
+          path: |
+            build.log
+            step-feeds.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Refresh package index
+        if: ${{ !inputs.test_only }}
+        working-directory: wrt
+        run: |
+          make package/index
+          find bin/targets/rtl9617c/generic/packages bin/packages \
+            -name packages.adb -printf '%p %s bytes\n' 2>/dev/null | sort || true
+
+      - name: Collect firmware + matching packages
+        if: ${{ !inputs.test_only }}
+        env:
+          PUBLISH_PACKAGES: ${{ inputs.publish_packages }}
+          VERIFIED_BUILD: ${{ inputs.verified_build }}
+          ENABLE_OFFLOAD: ${{ inputs.enable_offload }}
+          WAN_VLAN: ${{ inputs.wan_vlan }}
+        run: |
+          set -e
+          OUT="$GITHUB_WORKSPACE/artifact"
+          mkdir -p "$OUT"
+          cd "$GITHUB_WORKSPACE/wrt"
+          echo "===== bin/targets/rtl9617c/generic ====="
+          ls -lh bin/targets/rtl9617c/generic/ | head -40
+
+          find bin/targets/rtl9617c/generic -maxdepth 1 -type f \
+            -name "*${PROFILE}*" ! -name "*.json" -exec cp -v {} "$OUT/" \;
+          ls "$OUT/"*sysupgrade.itb >/dev/null 2>&1 \
+            || { echo "::error::没有产出 ${PROFILE} 的 sysupgrade.itb" >&2; exit 1; }
+
+          cp .config "$OUT/Config-final.txt"
+          echo "$SOURCE_HASH" > "$OUT/source-commit.txt"
+          {
+            echo "model=$MODEL ($BOARD_NAME)"
+            echo "profile=$PROFILE"
+            echo "dts=$DTS"
+            echo "source_ref=$SOURCE_REF"
+            echo "source_commit=$SOURCE_HASH"
+            echo "abi=ubi_device / factory(8MiB,static) / fit / rootfs_data"
+            echo "firmware=sysupgrade.itb (FIT external-static-with-rootfs)"
+            echo "arch_packages=aarch64_cortex-a55"
+            echo "kernel=$(grep -m1 '^CONFIG_LINUX_VERSION=' .config || echo 6.18)"
+            echo "offload_baseline=${ENABLE_OFFLOAD:-false}"
+            echo "wan_vlan=${WAN_VLAN:-upstream-default}"
+            echo "verified_build=${VERIFIED_BUILD:-false}"
+          } > "$OUT/BUILD_INFO.txt"
+
+          if [ "${VERIFIED_BUILD:-false}" != "true" ]; then
+            {
+              echo "DO NOT FLASH THIS IMAGE."
+              echo "This is a cloud-built artifact. The TYFZA1 DTS/Device come from"
+              echo "the upstream rtl9617c-openwrt tree, but THIS build has never been"
+              echo "booted on your hardware. Before flashing, verify the U-Boot FIT ABI,"
+              echo "factory volume data and UBI volume layout. Use this image first to"
+              echo "validate the build pipeline, then rerun with verified_build=true."
+            } > "$OUT/DO-NOT-FLASH-EXPERIMENTAL.txt"
+          fi
+
+          case "$PUBLISH_PACKAGES" in
+            false) DO_PACKAGES=0 ;;
+            *)     DO_PACKAGES=1 ;;
+          esac
+          if [ "$DO_PACKAGES" = "1" ]; then
+            ROOT="$GITHUB_WORKSPACE/pkgroot"
+            rm -rf "$ROOT"
+            mkdir -p "$ROOT/targets/rtl9617c/generic/packages" "$ROOT/packages"
+            cp -a bin/targets/rtl9617c/generic/packages/. \
+                  "$ROOT/targets/rtl9617c/generic/packages/" 2>/dev/null || true
+            if [ -d bin/packages ]; then cp -a bin/packages/. "$ROOT/packages/"; fi
+            KMOD_N=$(find "$ROOT" -type f -name 'kmod-*.apk' | wc -l)
+            APK_N=$(find "$ROOT" -type f -name '*.apk' | wc -l)
+            IDX_N=$(find "$ROOT" -type f -name 'packages.adb' | wc -l)
+            echo "===== packages: kmod=$KMOD_N apk=$APK_N index=$IDX_N ====="
+            test "$KMOD_N" -gt 0 || { echo "::error::没有 kmod-*.apk" >&2; exit 1; }
+            test "$APK_N"  -gt 0 || { echo "::error::没有 .apk" >&2; exit 1; }
+            test "$IDX_N"  -gt 0 || { echo "::error::没有 packages.adb" >&2; exit 1; }
+            [ -f public-key.pem ] && cp public-key.pem "$ROOT/public-key.pem" \
+              || echo "WARN: public-key.pem 缺失，跨批次装包需自行导公钥" >&2
+            {
+              echo "# 同批 packages（源码 $SOURCE_REF @ $SOURCE_HASH，架构 aarch64_cortex-a55）"
+              echo "# 解包到静态站点根 BASE 后写入 /etc/apk/repositories.d/customfeeds.list"
+              echo "BASE/targets/rtl9617c/generic/packages/packages.adb"
+              find "$ROOT/packages" -name packages.adb -printf '%P\n' 2>/dev/null \
+                | sort | sed 's|^|BASE/packages/|' || true
+            } > "$ROOT/apk-repos.txt"
+            {
+              echo "source_ref=$SOURCE_REF"
+              echo "source_commit=$SOURCE_HASH"
+              echo "target=rtl9617c/generic"
+              echo "profile=$PROFILE"
+              echo "arch_packages=aarch64_cortex-a55"
+              echo "kmods=$KMOD_N apks=$APK_N indexes=$IDX_N"
+            } > "$ROOT/BUILD_INFO.txt"
+            cd "$GITHUB_WORKSPACE"
+            tar --zstd -cf "artifact/packages-${{ inputs.board }}-${{ github.run_number }}.tar.zst" \
+                -C "$ROOT" .
+            ls -lh "artifact/packages-${{ inputs.board }}-${{ github.run_number }}.tar.zst"
+          fi
+
+          cd "$OUT"
+          find . -maxdepth 1 -type f ! -name sha256sums.txt -printf '%f\n' \
+            | sort | xargs sha256sum > sha256sums.txt
+          echo "===== artifact ====="
+          ls -lh
+
+      - name: Upload firmware
+        if: ${{ !inputs.test_only }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: tyfza1-${{ inputs.board }}-fit-${{ github.run_number }}
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ !inputs.test_only && inputs.create_release && inputs.verified_build }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: tyfza1-${{ inputs.board }}-fit-${{ github.run_number }}
+          name: TYFZA1-${{ inputs.board }} FIT (${{ github.run_number }})
+          files: artifact/*
+          body: |
+            源码 lyq1996/rtl9617c-openwrt `${{ env.SOURCE_REF }}` @ `${{ env.SOURCE_HASH }}`
+            机型 `${{ env.MODEL }}` / profile `${{ env.PROFILE }}` / DTS `${{ env.DTS }}`
+            ABI：factory(8 MiB static) + fit + rootfs_data，产物 sysupgrade.itb
+            配置见 Config-final.txt；校验见 sha256sums.txt
+            同批 packages 见 `packages-*.tar.zst`，用法见包内 apk-repos.txt
+            ⚠️ 刷机前必须确认 U-Boot FIT ABI、factory 导入与卷表重建。
